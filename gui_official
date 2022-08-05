@@ -1,0 +1,689 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jul 21 15:05:52 2022
+
+@author: asc-kawakamigroup-jjgregory
+
+"""
+# Challenge: Create an interactive GUI that contains a graph plot of
+# temperature vs. time, setpoint vs. time, setpoint adjustment buttons, and
+# ramp rate adjustment buttons. 
+
+# Brainstorming code:
+    # Generate graph from time frame (May need external database -- R, SQL)
+    # Graph analytics ??? (R, SQL)
+    # store data in large list, reset list at 3AM. able to be pulled from
+    # code "flags" graph changes. ex. dips under SP creates flag w timestamp
+
+import sys
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.uic import loadUi
+from PyQt5.QtWidgets import *
+from PyQt5.QtGui import *
+from PyQt5.QtCore import *
+
+from matplotlib.figure import Figure
+import matplotlib.animation as animation
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from datetime import timedelta, datetime
+from time import strftime
+from time import gmtime
+import datetime as dt
+import numpy as np
+import matplotlib
+matplotlib.use("Qt5Agg")
+
+from pyModbusTCP.client import ModbusClient
+
+""" initialize all Eurotherm clientele, Modbus addresses """
+if __name__ == '__main__':
+    c222 = ModbusClient(host='192.168.111.222', port=502, auto_open=True)
+    c223 = ModbusClient(host='192.168.111.223', port=502, auto_open=True)
+    c224 = ModbusClient(host='192.168.111.224', port=502, auto_open=True)
+    c225 = ModbusClient(host='192.168.111.225', port=502, auto_open=True)
+    
+    pv_addr = 289
+    sp_addr = 2
+    wo_addr = 4
+    rr1_addr = 1282
+    cjc_temp_addr = 215
+    MVin_addr = 202
+
+class MainWindow(QMainWindow):    
+    def __init__(self):
+        super(MainWindow, self).__init__()
+        loadUi(r'C:\Python\gui-files\eurotherm_gui.ui', self)
+        
+        """ all qtdesigner widgets here! """
+     
+        self.ChangeSP.clicked.connect(self.SPfunction) #setpoint button
+        self.ChangeRR.clicked.connect(self.RRfunction) #ramp rate button
+        
+        self.RefreshVals.clicked.connect(self.RefreshFunction) #refresh values button
+        self.discrepancyCheck = self.findChild(QLabel, "discrepancyCheck") #flags a manual change
+        timerCheck = QTimer(self)
+        timerCheck.timeout.connect(self.discrepancyAssess)
+        timerCheck.start(1000) #looks for value change every second
+        
+        self.slider = self.findChild(QSlider, "zoomSlider") # zoom in/out slider
+        self.label = self.findChild(QLabel, "zoomVal") # zoom slider -- value text
+        self.slider.valueChanged.connect(self.slide_val) # changes zoom value text
+        self.slider.setTickPosition(QSlider.TicksBelow) #places ticks on slider
+        self.slider.setTickInterval(100) #tick interval every 50 positons
+        self.slider.setSingleStep(100) #user can only increment by 10 units per step
+        
+        # displays current version of matplotlib on screen
+        mpltv = matplotlib.__version__
+        self.matplotlib_version_txt.setText(f"Running Matplotlib Version {mpltv}")
+        
+        # timers / countdown label / working output label initialization
+        timer = QTimer(self)
+        timer.timeout.connect(self.onTimeout)
+        timer.start(1000)
+        timeLabel = self.findChild(QLabel, f"timeLabel")
+        
+        timer2 = QTimer(self)
+        timer2.timeout.connect(self.workingOutput_updater)
+        timer2.start(10)
+        wo_222_label = self.findChild(QLabel, f"wo_222_label")
+        wo_223_label = self.findChild(QLabel, f"wo_223_label")
+        wo_224_label = self.findChild(QLabel, f"wo_224_label")
+        wo_224_label = self.findChild(QLabel, f"wo_225_label")
+      
+        # zoom in and out functions for the four graphs 
+        self.zoomin222.clicked.connect(self.zoomin222function) 
+        self.zoomout222.clicked.connect(self.zoomout222function) 
+      
+        self.zoomin223.clicked.connect(self.zoomin223function) 
+        self.zoomout223.clicked.connect(self.zoomout223function)
+      
+        self.zoomin224.clicked.connect(self.zoomin224function)
+        self.zoomout224.clicked.connect(self.zoomout224function)
+        
+        self.zoomin225.clicked.connect(self.zoomin225function)
+        self.zoomout225.clicked.connect(self.zoomout225function)
+        
+        # create combo box to select alt displays, then add items
+        
+        # TO DO: Add items with desired graphs of your choosing. Below are some
+        # examples. I encourage you to discover Infinicon / Python interactions
+        # and make it possible to see Deposition Monitor plots in the 
+        # drop down.
+        
+        drop_down = self.findChild(QComboBox, f"graphSelect")
+        drop_down.addItem("-- Select desired alternate graph --")
+        drop_down.addItem("Working Output (%) vs. Time")
+        drop_down.addItem("Ramp Rate (°C/Min) vs. Time")
+        drop_down.addItem("CJC Temperature (°C) vs. Time")
+        drop_down.addItem("Working Setpoint (°C) vs. Time")
+        drop_down.addItem("Measured Value (mV) vs. Time")
+        drop_down.addItem("Working Setpoint (°C), CJC Temperature (°C) vs. Time")
+        drop_down.addItem("Working Setpoint (°C), Temperature (°C) vs. Time")
+        drop_down.addItem("CJC Temperature (°C), Temperature (°C) vs. Time")
+        
+        # 'OK' Button that will write the new graphs.
+        self.writeAlts.clicked.connect(self.writeAltsFunction)
+        
+        """ display the initial SP & RR values in SpinBox UPON opening GUI """
+        
+        a = c222.read_holding_registers(sp_addr,1)[0]/10.0
+        b = c223.read_holding_registers(sp_addr,1)[0]/10.0
+        c = c224.read_holding_registers(sp_addr,1)[0]/10.0
+        d = c225.read_holding_registers(sp_addr,1)[0]/10.0
+        self.SPset222.setValue(a)
+        self.SPset223.setValue(b)
+        self.SPset224.setValue(c)
+        self.SPset225.setValue(d)
+        
+        e = c222.read_holding_registers(rr1_addr,1)[0]
+        f = c223.read_holding_registers(rr1_addr,1)[0]
+        g = c224.read_holding_registers(rr1_addr,1)[0]
+        h = c225.read_holding_registers(rr1_addr,1)[0]
+        self.RRset222.setValue(e)
+        self.RRset223.setValue(f)
+        self.RRset224.setValue(g)
+        self.RRset225.setValue(h)
+        
+        """ create all four main plots """ 
+        
+        self.hLayout1 = self.findChild(QGridLayout, "gridLayout222")
+        self.hLayout2 = self.findChild(QGridLayout, "gridLayout223")
+        self.hLayout3 = self.findChild(QGridLayout, "gridLayout224")
+        self.hLayout4 = self.findChild(QGridLayout, "gridLayout225")
+        
+        # there is likely a more efficient way to do this, but I have
+        # to create four parallel time arrays. python does not like
+        # appending dt to multiple iterations of self.n  :/
+        
+        # four time arrays
+        self.n = []
+        self.n2 = []
+        self.n3 = []
+        self.n4 = []
+        
+        self.y222 = [] # create 222 temperature list
+        self.y223 = [] # create 223 temperature list
+        self.y224 = [] # create 224 temperature list
+        self.y225 = [] # create 225 temperature list
+        
+        self.z222 = [] # create 222 setpoint list
+        self.z223 = [] # create 223 setpoint list
+        self.z224 = [] # create 224 setpoint list
+        self.z225 = [] # create 225 setpoint list
+        
+        self.fig = Figure() # 222 fig
+        self.fig2 = Figure() # 223 fig
+        self.fig3 = Figure() # 224 fig
+        self.fig4 = Figure() # 225 fig
+        
+        # fig axes, aka 222 plot
+        self.ax1 = self.fig.add_subplot()
+        self.ax1.plot(self.n, self.y222)
+        
+        # fig2 axes, aka 223 plot
+        self.ax2 = self.fig2.add_subplot()
+        self.ax2.plot(self.n2, self.y223)
+        
+        # fig3 axes, aka 223 plot
+        self.ax3 = self.fig3.add_subplot()
+        self.ax3.plot(self.n3, self.y224)
+                      
+        # fig4 axes, aka 223 plot
+        self.ax4 = self.fig4.add_subplot()
+        self.ax4.plot(self.n4, self.y225)
+        
+        # create the four figure canvases (where the figures get plotted)
+        self.FC222 = FigureCanvas(self.fig)
+        self.FC223 = FigureCanvas(self.fig2)
+        self.FC224 = FigureCanvas(self.fig3)
+        self.FC225 = FigureCanvas(self.fig4)
+        
+        # add the canvases to the QtDesigner grid layout
+        self.hLayout1.addWidget(self.FC222, *(0,1))
+        self.hLayout2.addWidget(self.FC223, *(0,1))
+        self.hLayout3.addWidget(self.FC224, *(0,1))
+        self.hLayout4.addWidget(self.FC225, *(0,1))
+        
+        """ create the four alternate graphs (same process as above) """
+        
+        self.althLayout1 = self.findChild(QGridLayout, "altLayout222")
+        self.althLayout2 = self.findChild(QGridLayout, "altLayout223")
+        self.althLayout3 = self.findChild(QGridLayout, "altLayout224")
+        self.althLayout4 = self.findChild(QGridLayout, "altLayout225")
+        
+        self.altn = []
+        self.altn2 = []
+        self.altn3 = []
+        self.altn4 = []
+        
+        self.alty222 = [] # alt 222 y axis
+        self.alty223 = [] # alt 223 y axis
+        self.alty224 = [] # alt 224 y axis
+        self.alty225 = [] # alt 225 y axis
+        
+        self.altz222 = [] # alt 222 z axis
+        self.altz223 = [] # alt 223 z axis
+        self.altz224 = [] # alt 224 z axis
+        self.altz225 = [] # alt 225 z axis
+        
+        self.altfig = Figure() # alt 222 fig
+        self.altfig2 = Figure() # alt 223 fig
+        self.altfig3 = Figure() # alt 224 fig
+        self.altfig4 = Figure() # alt 225 fig
+        
+        # create axes, plots, figurecanvases, add to grids. same as above
+        self.altax1 = self.altfig.add_subplot()
+        self.altax1.plot(self.altn, self.alty222)
+        
+        self.altax2 = self.altfig2.add_subplot()
+        self.altax2.plot(self.altn2, self.alty223)
+        
+        self.altax3 = self.altfig3.add_subplot()
+        self.altax3.plot(self.n3, self.y224)
+                      
+        self.altax4 = self.altfig4.add_subplot()
+        self.altax4.plot(self.altn4, self.alty225)
+        
+        self.altFC222 = FigureCanvas(self.altfig)
+        self.altFC223 = FigureCanvas(self.altfig2)
+        self.altFC224 = FigureCanvas(self.altfig3)
+        self.altFC225 = FigureCanvas(self.altfig4)
+        
+        self.althLayout1.addWidget(self.altFC222, *(0,1))
+        self.althLayout2.addWidget(self.altFC223, *(0,1))
+        self.althLayout3.addWidget(self.altFC224, *(0,1))
+        self.althLayout4.addWidget(self.altFC225, *(0,1))
+        
+        """ start the time (used later in every time array) """
+        
+        self.tStart = dt.datetime.now()
+   
+    """ define functions """
+    
+    """ next four functions are defining the animation processes of four main graphs """
+    
+    def animate(self, i, n, y222, z222):
+        td = dt.datetime.now() - self.tStart
+        td = timedelta.total_seconds(td)
+        
+        #graph222
+        self.n.append(td)
+        self.y222.append(c222.read_holding_registers(pv_addr,1)[0]/10.0)
+        self.z222.append(c222.read_holding_registers(sp_addr,1)[0]/10.0)
+        n = n[-60:]
+        y222 = y222[-60:]
+        z222 = z222[-60:]
+
+        self.ax1.clear()
+        self.ax1.set_xlabel('Time')
+        self.ax1.set_ylabel('Temperature (°C)')
+        self.ax1.plot(n,y222, color = "chartreuse")
+        self.ax1.plot(n,z222, color = "fuchsia")
+        self.ax1.autoscale()
+        
+        self.fig.patch.set_facecolor('#191919')
+        
+        self.ax1.set_facecolor('#191919')
+        self.ax1.tick_params(axis = 'x', colors='white')
+        self.ax1.tick_params(axis = 'y', colors='white')
+        self.ax1.xaxis.label.set_color('white')
+        self.ax1.yaxis.label.set_color('white')
+        self.ax1.spines['left'].set_color('gainsboro')
+        self.ax1.spines['right'].set_color('gainsboro')
+        self.ax1.spines['top'].set_color('gainsboro')
+        self.ax1.spines['bottom'].set_color('gainsboro')
+        
+    def animate2(self, i, n2, y223, z223):
+        
+       td = dt.datetime.now() - self.tStart
+       td = timedelta.total_seconds(td)
+       
+       #graph223
+       self.n2.append(td)
+       self.y223.append(c223.read_holding_registers(pv_addr,1)[0]/10.0)
+       self.z223.append(c223.read_holding_registers(sp_addr,1)[0]/10.0)
+       n2 = n2[-60:]
+       y223 = y223[-60:]
+       z223 = z223[-60:]
+
+       self.ax2.clear()
+       self.ax2.set_xlabel('Time')
+       self.ax2.set_ylabel('Temperature (°C)')
+       self.ax2.plot(n2,y223, color = "chartreuse")
+       self.ax2.plot(n2,z223, color = "fuchsia")
+       
+       self.fig2.patch.set_facecolor('#191919')
+       self.ax2.set_facecolor('#191919')
+       self.ax2.tick_params(axis = 'x', colors='white')
+       self.ax2.tick_params(axis = 'y', colors='white')
+       self.ax2.xaxis.label.set_color('white')
+       self.ax2.yaxis.label.set_color('white')
+       self.ax2.spines['left'].set_color('gainsboro')
+       self.ax2.spines['right'].set_color('gainsboro')
+       self.ax2.spines['top'].set_color('gainsboro')
+       self.ax2.spines['bottom'].set_color('gainsboro') 
+       
+    def animate3(self, i, n3, y224, z224):
+         
+        td = dt.datetime.now() - self.tStart
+        td = timedelta.total_seconds(td)
+        
+        #graph224
+        self.n3.append(td)
+        self.y224.append(c224.read_holding_registers(pv_addr,1)[0]/10.0)
+        self.z224.append(c224.read_holding_registers(sp_addr,1)[0]/10.0)
+        n3 = n3[-60:]
+        y224 = y224[-60:]
+        z224 = z224[-60:]
+
+        self.ax3.clear()
+        self.ax3.set_xlabel('Time')
+        self.ax3.set_ylabel('Temperature (°C)')
+        self.ax3.plot(n3,y224, color = "chartreuse")
+        self.ax3.plot(n3,z224, color = "fuchsia")
+        
+        self.fig3.patch.set_facecolor('#191919')
+        
+        self.ax3.set_facecolor('#191919')
+        self.ax3.tick_params(axis = 'x', colors='white')
+        self.ax3.tick_params(axis = 'y', colors='white')
+        self.ax3.xaxis.label.set_color('white')
+        self.ax3.yaxis.label.set_color('white')
+        self.ax3.spines['left'].set_color('gainsboro')
+        self.ax3.spines['right'].set_color('gainsboro')
+        self.ax3.spines['top'].set_color('gainsboro')
+        self.ax3.spines['bottom'].set_color('gainsboro') 
+        
+    def animate4(self, i, n4, y225, z225):
+         
+        td = dt.datetime.now() - self.tStart
+        td = timedelta.total_seconds(td)
+        
+        #graph225
+        self.n4.append(td)
+        self.y225.append(c225.read_holding_registers(pv_addr,1)[0]/10.0)
+        self.z225.append(c225.read_holding_registers(sp_addr,1)[0]/10.0)
+        n4 = n4[-60:]
+        y225 = y225[-60:]
+        z225 = z225[-60:]
+
+        self.ax4.clear()
+        self.ax4.set_xlabel('Time')
+        self.ax4.set_ylabel('Temperature (°C)')
+        self.ax4.plot(n4,y225, color = "chartreuse")
+        self.ax4.plot(n4,z225, color = "fuchsia")
+        
+        self.fig4.patch.set_facecolor('#191919')
+        
+        self.ax4.set_facecolor('#191919')
+        self.ax4.tick_params(axis = 'x', colors='white')
+        self.ax4.tick_params(axis = 'y', colors='white')
+        self.ax4.xaxis.label.set_color('white')
+        self.ax4.yaxis.label.set_color('white')
+        self.ax4.spines['left'].set_color('gainsboro')
+        self.ax4.spines['right'].set_color('gainsboro')
+        self.ax4.spines['top'].set_color('gainsboro')
+        self.ax4.spines['bottom'].set_color('gainsboro') 
+        
+    """ now we will definte the animations of the four alternate graphs """
+    
+    # TO DO: Replace these functions with setups for their alternate plots
+    # which will be called on by the later writeAltsFunction.
+    
+    def animateAlternate1(self, i, altn, alty222, altz222):
+        td = dt.datetime.now() - self.tStart
+        td = timedelta.total_seconds(td)
+        
+        self.altn.append(td)
+        self.alty222.append(4*np.sin(td/3.14))
+        self.altz222.append(np.cos(td/3.14))
+        altn = altn[-30:]
+        alty222 = alty222[-30:]
+        altz222 = altz222[-30:]
+
+        self.altax1.clear()
+        self.altax1.set_xlabel('Time')
+        self.altax1.set_ylabel('[Raw 222 Data]')
+        self.altax1.plot(altn,alty222, color = "aqua")
+        self.altax1.plot(altn,altz222, color = "#ffff00")
+        
+        self.altfig.patch.set_facecolor('#191919')
+        
+        self.altax1.set_facecolor('#191919')
+        self.altax1.tick_params(axis = 'x', colors='white')
+        self.altax1.tick_params(axis = 'y', colors='white')
+        self.altax1.xaxis.label.set_color('white')
+        self.altax1.yaxis.label.set_color('white')
+        self.altax1.spines['left'].set_color('gainsboro')
+        self.altax1.spines['right'].set_color('gainsboro')
+        self.altax1.spines['top'].set_color('gainsboro')
+        self.altax1.spines['bottom'].set_color('gainsboro')
+        
+    def animateAlternate2(self, i, altn2, alty223, altz223):
+        
+       td = dt.datetime.now() - self.tStart
+       td = timedelta.total_seconds(td)
+       
+       self.altn2.append(td)
+       self.alty223.append(np.sin(td/3.14*2))
+       self.altz223.append(np.cos(td/3.14))
+       altn2 = altn2[-45:]
+       alty223 = alty223[-45:]
+       altz223 = altz223[-45:]
+
+       self.altax2.clear()
+       self.altax2.set_xlabel('Time')
+       self.altax2.set_ylabel('[Raw 223 Data]')
+       self.altax2.plot(altn2,alty223, color = "aqua")
+       self.altax2.plot(altn2,altz223, color = "#ffff00")
+       
+       self.altfig2.patch.set_facecolor('#191919')
+       
+       self.altax2.set_facecolor('#191919')
+       self.altax2.tick_params(axis = 'x', colors='white')
+       self.altax2.tick_params(axis = 'y', colors='white')
+       self.altax2.xaxis.label.set_color('white')
+       self.altax2.yaxis.label.set_color('white')
+       self.altax2.spines['left'].set_color('gainsboro')
+       self.altax2.spines['right'].set_color('gainsboro')
+       self.altax2.spines['top'].set_color('gainsboro')
+       self.altax2.spines['bottom'].set_color('gainsboro') 
+       
+    def animateAlternate3(self, i, altn3, alty224, altz224):
+         
+        td = dt.datetime.now() - self.tStart
+        td = timedelta.total_seconds(td)
+        
+        self.altn3.append(td)
+        self.alty224.append(np.sin(td/3.14))
+        self.altz224.append(3*np.cos(td/3.14))
+        altn3 = altn3[-60:]
+        alty224 = alty224[-60:]
+        altz224 = altz224[-60:]
+
+        self.altax3.clear()
+        self.altax3.set_xlabel('Time')
+        self.altax3.set_ylabel('[Raw 224 Data]')
+        self.altax3.plot(altn3,alty224, color = "aqua")
+        self.altax3.plot(altn3,altz224, color = "#ffff00")
+        
+        self.altfig3.patch.set_facecolor('#191919')
+        
+        self.altax3.set_facecolor('#191919')
+        self.altax3.tick_params(axis = 'x', colors='white')
+        self.altax3.tick_params(axis = 'y', colors='white')
+        self.altax3.xaxis.label.set_color('white')
+        self.altax3.yaxis.label.set_color('white')
+        self.altax3.spines['left'].set_color('gainsboro')
+        self.altax3.spines['right'].set_color('gainsboro')
+        self.altax3.spines['top'].set_color('gainsboro')
+        self.altax3.spines['bottom'].set_color('gainsboro') 
+        
+    def animateAlternate4(self, i, altn4, alty225, altz225):
+         
+        td = dt.datetime.now() - self.tStart
+        td = timedelta.total_seconds(td)
+        
+        #graph225
+        self.altn4.append(td)
+        self.alty225.append(np.sin(4*td/3.14))
+        self.altz225.append(np.cos(td/3.14))
+        altn4 = altn4[-75:]
+        alty225 = alty225[-75:]
+        altz225 = altz225[-75:]
+
+        self.altax4.clear()
+        self.altax4.set_xlabel('Time')
+        self.altax4.set_ylabel('[Raw 225 Data]')
+        self.altax4.plot(altn4,alty225, color = "aqua")
+        self.altax4.plot(altn4,altz225, color = "#ffff00")
+        
+        self.altfig4.patch.set_facecolor('#191919')
+        
+        self.altax4.set_facecolor('#191919')
+        self.altax4.tick_params(axis = 'x', colors='white')
+        self.altax4.tick_params(axis = 'y', colors='white')
+        self.altax4.xaxis.label.set_color('white')
+        self.altax4.yaxis.label.set_color('white')
+        self.altax4.spines['left'].set_color('gainsboro')
+        self.altax4.spines['right'].set_color('gainsboro')
+        self.altax4.spines['top'].set_color('gainsboro')
+        self.altax4.spines['bottom'].set_color('gainsboro') 
+    
+    """ moving on, we define widget and button functions """
+
+    def closeEvent(self, event): 
+    # very important; stops animations from continuing to count after close
+        ani.event_source.stop()
+        ani2.event_source.stop()
+        ani3.event_source.stop()
+        ani4.event_source.stop()
+        altani.event_source.stop()
+        altani2.event_source.stop()
+        altani3.event_source.stop()
+        altani4.event_source.stop()
+        self.close()
+ 
+    def discrepancyAssess(self):
+        a = c222.read_holding_registers(sp_addr,1)[0]/10.0
+        b = c223.read_holding_registers(sp_addr,1)[0]/10.0
+        c = c224.read_holding_registers(sp_addr,1)[0]/10.0
+        d = c225.read_holding_registers(sp_addr,1)[0]/10.0
+        e = c222.read_holding_registers(rr1_addr,1)[0]/10.0
+        f = c223.read_holding_registers(rr1_addr,1)[0]/10.0
+        g = c224.read_holding_registers(rr1_addr,1)[0]/10.0
+        h = c225.read_holding_registers(rr1_addr,1)[0]/10.0
+        if (
+                self.SPset222.value() != a
+                or self.SPset223.value() != b
+                or self.SPset224.value() != c
+                or self.SPset225.value() != d
+                or self.RRset222.value() != e
+                or self.RRset223.value() != f
+                or self.RRset224.value() != g
+                or self.RRset225.value() != h ):
+            self.discrepancyCheck.setText("Manual change detected. Please refresh spin boxes")
+        else:
+            self.discrepancyCheck.setText("")
+    
+    def onTimeout(self): # countdown update function executes every second
+        def seconds_till_end(current_time):
+            # Add 1 day to the current datetime, which will give us some time tomorrow
+            # Now set all the time values of tomorrow's datetime value to zero, 
+            # which gives us midnight. Changing hour to 3 gives us 3AM.
+            threeAM = (current_time + timedelta(days=1)).replace(hour=3, minute=0, microsecond=0, second=0)
+            # Subtracting 2 datetime values returns a timedelta
+            # now we can return the total amount of seconds till 3AM
+            return (threeAM - current_time).seconds
+        now = datetime.now()
+        seconds_left_in_the_day = seconds_till_end(now) # call on the return val
+        string = strftime("%H:%M:%S", gmtime(seconds_left_in_the_day)) # format from seconds to HH:MM:SS
+        self.timeLabel.setText(string)
+        
+    def RefreshFunction(self):
+        # reads device values and resets spin boxes with new vals
+        a = c222.read_holding_registers(sp_addr,1)[0]/10.0
+        b = c223.read_holding_registers(sp_addr,1)[0]/10.0
+        c = c224.read_holding_registers(sp_addr,1)[0]/10.0
+        d = c225.read_holding_registers(sp_addr,1)[0]/10.0
+        e = c222.read_holding_registers(rr1_addr,1)[0]/10.0
+        f = c223.read_holding_registers(rr1_addr,1)[0]/10.0
+        g = c224.read_holding_registers(rr1_addr,1)[0]/10.0
+        h = c225.read_holding_registers(rr1_addr,1)[0]/10.0
+        
+        self.SPset222.setValue(a)
+        self.SPset223.setValue(b)
+        self.SPset224.setValue(c)
+        self.SPset225.setValue(d)
+        self.RRset222.setValue(e)
+        self.RRset223.setValue(f)
+        self.RRset224.setValue(g)
+        self.RRset225.setValue(h)
+    
+    def slide_val(self, zvalue):
+        # changes the value of text when zoom slider is moved
+        self.label.setText(str(zvalue))
+        
+         
+    def SPfunction(self):
+        # button updates all devices with new SP or does nothing for unchanaged vals
+        a = self.SPset222.value() 
+        b = self.SPset223.value()
+        c = self.SPset224.value()
+        d = self.SPset225.value()
+        c222.write_single_register(sp_addr,int(a*10.0))
+        c223.write_single_register(sp_addr,int(b*10.0))
+        c224.write_single_register(sp_addr,int(c*10.0))
+        c225.write_single_register(sp_addr,int(d*10.0))
+       
+        #display updated setpoints in status bar
+        self.statusbar.showMessage(f"Setpoints (C): {a}, {b}, {c}, {d}")
+        
+    def RRfunction(self):
+        # does same thing as SP function, only ramp rates are changed instead
+        
+        e = self.RRset222.value() 
+        f = self.RRset223.value()
+        g = self.RRset224.value()
+        h = self.RRset225.value()
+        c222.write_single_register(rr1_addr,int(e*10.0))
+        c223.write_single_register(rr1_addr,int(f*10.0))
+        c224.write_single_register(rr1_addr,int(g*10.0))
+        c225.write_single_register(rr1_addr,int(h*10.0))
+       
+        self.statusbar.showMessage( #display updated ramp rates in status bar
+            f"Ramp rates (C/Min): {e}, {f}, {g}, {h}")
+        
+    def workingOutput_updater(self):
+        wo_222 = c222.read_holding_registers(wo_addr,1)[0]/10.0
+        wo_223 = c223.read_holding_registers(wo_addr,1)[0]/10.0
+        wo_224 = c224.read_holding_registers(wo_addr,1)[0]/10.0
+        wo_225 = c225.read_holding_registers(wo_addr,1)[0]/10.0
+        self.wo_222_label.setText(f'{wo_222}%')
+        self.wo_223_label.setText(f'{wo_223}%')
+        self.wo_224_label.setText(f'{wo_224}%')
+        self.wo_225_label.setText(f'{wo_225}%')
+        
+        
+    # TO DO: Create function that performs logical test to write alternate graphs. 
+    # This function can be moved or embedded into another function.
+    # My thought process: evaluate the combo box text. Logical check to evaluate matches. Call on animateAlternate functions, plot axes accordingly.
+    # If no matches, either no graph or basic sinewave graph. Up to you!
+    
+    def writeAltsFunction(self):
+        print("Function undergoing technical maintence... beep boop!")
+        
+    # TO DO: Create functions such that they call on their respective 
+    # graph's n list and change the n[-60:] value to the zvalue. Draw the 
+    # graphs, print status bar message. Call on animate functions.
+    
+    def zoomin222function(self):
+        zvalue = int(self.label.text())
+        self.statusbar.showMessage(f"Zoomed in by factor {zvalue}.")
+        print(f'Zoom factor is {str(zvalue)}.')
+        
+    def zoomout222function(self, zvalue):
+        self.fig.zoomOut(zvalue)
+        self.statusbar.showMessage(f'Zoomed out Device 222 graph by {zvalue} units.')
+        
+    def zoomin223function(self, zvalue):
+        self.fig2.zoomIn(zvalue)
+        self.statusbar.showMessage(f'Zoomed in Device 223 graph by {zvalue} units.')
+        
+    def zoomout223function(self, zvalue):
+        self.fig2.zoomOut(zvalue)
+        self.statusbar.showMessage(f'Zoomed out Device 223 graph by {zvalue} units.')
+    
+    def zoomin224function(self, zvalue):
+        self.fig3.zoomIn(zvalue)
+        self.statusbar.showMessage(f'Zoomed in Device 224 graph by {zvalue} units.')
+        
+    def zoomout224function(self, zvalue):
+        self.fig3.zoomOut(zvalue)
+        self.statusbar.showMessage(f'Zoomed out Device 224 graph by {zvalue} units.')
+    
+    def zoomin225function(self, zvalue):
+        self.fig4.zoomIn(zvalue)
+        self.statusbar.showMessage(f'Zoomed in Device 225 graph by {zvalue} units.')
+        
+    def zoomout225function(self, zvalue):
+        self.fig4.zoomOut(zvalue)
+        self.statusbar.showMessage(f'Zoomed out Device 225 graph by {zvalue} units.')
+        
+app = QApplication([])
+Window = MainWindow()
+Window.setWindowTitle('Eurotherm Plot/Read & Write Window')
+
+""" call the animations into the window using the FuncAnimation arguments """
+ani = matplotlib.animation.FuncAnimation(Window.fig, Window.animate, fargs=(Window.n, Window.y222, Window.z222),interval=500)
+ani2 = matplotlib.animation.FuncAnimation(Window.fig2, Window.animate2, fargs=(Window.n2, Window.y223, Window.z223),interval=500)
+ani3 = matplotlib.animation.FuncAnimation(Window.fig3, Window.animate3, fargs=(Window.n3, Window.y224, Window.z224),interval=500)
+ani4 = matplotlib.animation.FuncAnimation(Window.fig4, Window.animate4, fargs=(Window.n4, Window.y225, Window.z225),interval=500)
+
+altani = matplotlib.animation.FuncAnimation(Window.altfig, Window.animateAlternate1, fargs=(Window.altn, Window.alty222, Window.altz222),interval=1000)
+altani2 = matplotlib.animation.FuncAnimation(Window.altfig2, Window.animateAlternate2, fargs=(Window.altn2, Window.alty223, Window.altz223),interval=1000)
+altani3 = matplotlib.animation.FuncAnimation(Window.altfig3, Window.animateAlternate3, fargs=(Window.altn3, Window.alty224, Window.altz224),interval=1000)
+altani4 = matplotlib.animation.FuncAnimation(Window.altfig4, Window.animateAlternate4, fargs=(Window.altn4, Window.alty225, Window.altz225),interval=1000)
+
+Window.show()
+sys.exit(app.exec_()) 
